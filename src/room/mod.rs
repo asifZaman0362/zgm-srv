@@ -1,4 +1,5 @@
 use crate::game::Game;
+use crate::server::Server;
 use crate::session::{
     message::{OutgoingMessage, RemoveReason},
     SerializedMessage, Session,
@@ -15,8 +16,34 @@ pub struct PlayerInRoom {
 pub struct Room {
     players: HashMap<Addr<Session>, PlayerInRoom>,
     game: Option<Game>,
+    leader: String,
+    code: String,
     max_player_count: usize,
-    // further configuration / extra state
+    server: Addr<Server>, // further configuration / extra state
+}
+
+impl Room {
+    pub fn new(
+        code: String,
+        server: Addr<Server>,
+        leader_id: String,
+        leader_addr: Addr<Session>,
+        max_player_count: usize,
+    ) -> Self {
+        let leader = PlayerInRoom {
+            id: leader_id.clone(),
+            addr: leader_addr.clone(),
+        };
+        let players = HashMap::from([(leader_addr, leader)]);
+        Self {
+            players,
+            game: None,
+            leader: leader_id,
+            code,
+            max_player_count,
+            server,
+        }
+    }
 }
 
 impl Actor for Room {
@@ -44,8 +71,8 @@ pub struct AddPlayer {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct RemovePlayer {
-    addr: Addr<Session>,
-    reason: RemoveReason,
+    pub addr: Addr<Session>,
+    pub reason: RemoveReason,
 }
 
 #[derive(Message)]

@@ -9,6 +9,8 @@ pub enum IncomingMessage {
 #[derive(Serialize)]
 pub enum RemoveReason {
     RoomClosed,
+    Logout,
+    Disconnected
 }
 
 #[derive(Serialize)]
