@@ -1,23 +1,23 @@
+use super::Server;
+use actix::Addr;
 use actix_web::{
-    web::{get, Payload},
+    web::{get, Data, Payload},
     App, HttpRequest, HttpResponse, HttpServer,
 };
 use actix_web_actors::ws;
 
-use crate::session::{message::SocketMessage, Session};
+use crate::session::Session;
 
-pub struct Http<T: SocketMessage> {
-    _phantom: std::marker::PhantomData<T>,
+async fn socket(
+    req: HttpRequest,
+    payload: Payload,
+    data: Data<Addr<Server>>,
+) -> actix_web::Result<HttpResponse> {
+    ws::start(Session::new(data.get_ref().to_owned()), &req, payload)
 }
-
-impl<T: SocketMessage> Http<T> {
-    async fn socket(req: HttpRequest, payload: Payload) -> actix_web::Result<HttpResponse> {
-        ws::start(Session::<T>::new(), &req, payload)
-    }
-    pub async fn start() -> std::io::Result<()> {
-        HttpServer::new(|| App::new().route("/ws", get().to(Self::socket)))
-            .bind("0.0.0.0:8000")?
-            .run()
-            .await
-    }
+pub async fn start() -> std::io::Result<()> {
+    HttpServer::new(|| App::new().route("/ws", get().to(socket)))
+        .bind("0.0.0.0:8000")?
+        .run()
+        .await
 }
