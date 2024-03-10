@@ -65,7 +65,7 @@ pub type RoomInfo = ();
 #[derive(Message)]
 #[rtype(result = "Result<RoomInfo, JoinRoomError>")]
 pub struct AddPlayer {
-    info: PlayerInRoom,
+    pub info: PlayerInRoom,
 }
 
 #[derive(Message)]
@@ -79,10 +79,13 @@ pub struct RemovePlayer {
 #[rtype(result = "()")]
 pub struct CloseRoom;
 
+#[derive(serde::Serialize)]
 pub enum JoinRoomError {
     RoomFull,
     GameInProgress,
     AlreadyInRoom,
+    RoomNotFound,
+    NotSignedIn,
 }
 
 impl Handler<AddPlayer> for Room {
@@ -111,10 +114,17 @@ impl Handler<AddPlayer> for Room {
 impl Handler<RemovePlayer> for Room {
     type Result = ();
     fn handle(&mut self, msg: RemovePlayer, ctx: &mut Self::Context) -> Self::Result {
-        if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.addr) {
-            addr.do_send(SerializedMessage(OutgoingMessage::RemoveFromRoom(
-                msg.reason,
-            )))
+        match msg.reason {
+            RemoveReason::LeaveRequested => {
+                /* We dont send a ClearRoom message if the client requested a leave since it is
+                 * expected from them to already clear their self.room field before requesting a
+                 * leave. */
+            }
+            reason => {
+                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.addr) {
+                    addr.do_send(crate::session::ClearRoom { reason });
+                }
+            }
         }
         /* It might be desirable to close the room, ending any ongoing games when there are less
          * than however many players are required to keep a game going. Handling this might

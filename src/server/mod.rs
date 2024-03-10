@@ -1,4 +1,4 @@
-use crate::room::{self, Room};
+use crate::room::{self, AddPlayer, JoinRoomError, PlayerInRoom, Room};
 use crate::session::Session;
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use rand::Rng;
@@ -12,11 +12,33 @@ struct SessionData {
     addr: Addr<Session>,
 }
 
+struct RoomInfo {
+    code: String,
+    addr: Addr<Room>,
+}
+
 pub struct Server {
+    /* A hashmap of sessions keyed by their server id.
+     * See: session/mod.rs for more information on server ids.
+     */
     sessions: HashMap<u128, SessionData>,
+    /* An inverted session map, used for quickly accessing session information using their client
+     * ids which is useful for reconnections / API queries. */
     sessions_inverted: HashMap<String, u128>,
-    public_rooms: HashMap<String, Addr<Room>>,
-    private_rooms: HashMap<String, Addr<Room>>,
+    /* List of all public rooms that *CANNOT* be joined, either due to having been filled completely
+     * or due to having games that are currently in progress.
+     * NOTE: Rooms must notify the server that they are no longer available for joining when such an
+     * event occurs (Room being Filled, Game Starting, etc).
+     * Same applies to private rooms.
+     */
+    public_rooms: HashMap<String, RoomInfo>,
+    /* List of all private rooms that *CANNOT* be joined, due to similar reasons as public room
+     * inavailability */
+    private_rooms: HashMap<String, RoomInfo>,
+    // List of all public rooms available for matching
+    public_matching_pool: HashMap<String, RoomInfo>,
+    // List of all private rooms that can be joined
+    private_matching_pool: HashMap<String, RoomInfo>,
 }
 
 impl Server {
@@ -26,6 +48,8 @@ impl Server {
             sessions_inverted: HashMap::new(),
             public_rooms: HashMap::new(),
             private_rooms: HashMap::new(),
+            private_matching_pool: HashMap::new(),
+            public_matching_pool: HashMap::new(),
         }
     }
 }
@@ -60,22 +84,22 @@ impl Handler<RegisterSession> for Server {
             if let Some(session) = self.sessions_inverted.get_mut(&msg.id) {
                 // We remove the older session entry from the session map
                 if let Some(mut data) = self.sessions.remove(session) {
-                    // This is a reconnection, let the room that the client was in before disconnecting
-                    // (if any) know of the updated session address
+                    /* This is a reconnection, let the room that the client was in before disconnecting
+                     * (if any) know of the updated session address. */
                     if let Some(room) = &data.room {
                         todo!("send client update message");
                     }
-                    // We force the older session actor to terminate
-                    // This is necessary since upon ping timeout, the session spawns a new timer
-                    // that is set to send a client disconnection message to the server after a
-                    // fixed limit which may result in removing the updated connection
+                    /* We force the older session actor to terminate
+                     * This is necessary since upon ping timeout, the session spawns a new timer
+                     * that is set to send a client disconnection message to the server after a
+                     * fixed limit which may result in removing the updated connection */
                     data.addr.do_send(crate::session::Stop {});
-                    // Then we push the updated session to the session table because the older
-                    // entry was removed
+                    /* Then we push the updated session to the session table because the older
+                     * entry was removed. */
                     data.addr = msg.addr.clone();
                     self.sessions.insert(msg.server_id, data);
-                    // And we also update the inverted session map to now point to the updated
-                    // session address
+                    /* And we also update the inverted session map to now point to the updated
+                     * session address. */
                     *session = msg.server_id;
                 }
             } else {
@@ -94,8 +118,8 @@ impl Handler<RegisterSession> for Server {
     }
 }
 
-// Permanent disconnection. Clients cannot rejoin a room after this point.
-// Same as a voluntary logout.
+/* Permanent disconnection. Clients cannot rejoin a room after this point.
+ * Same as a voluntary logout. */
 impl Handler<DeregisterSession> for Server {
     type Result = ();
     fn handle(&mut self, msg: DeregisterSession, _: &mut Self::Context) -> Self::Result {
@@ -113,15 +137,65 @@ impl Handler<DeregisterSession> for Server {
 }
 
 #[derive(Message)]
-#[rtype(result = "()")]
+#[rtype(result = "Result<(), JoinRoomError>")]
 pub struct JoinRoom {
     server_id: u128,
     code: Option<String>,
 }
 
 impl Handler<JoinRoom> for Server {
-    type Result = ();
-    fn handle(&mut self, msg: JoinRoom, ctx: &mut Self::Context) -> Self::Result {}
+    type Result = Result<(), JoinRoomError>;
+    fn handle(&mut self, msg: JoinRoom, ctx: &mut Self::Context) -> Self::Result {
+        let result = if let Some(player) = self.sessions.get(&msg.server_id) {
+            let info = PlayerInRoom {
+                id: player.id.clone(),
+                addr: player.addr.to_owned(),
+            };
+            /* If the message contains a room code, then we look for that room in both private and
+             * public room pools. */
+            if let Some(code) = msg.code {
+                if let Some(RoomInfo { addr, .. }) = self.private_rooms.get(&code) {
+                    addr.do_send(AddPlayer { info });
+                    /* Even though this is an Ok() value, it doesnt necessary mean that the room
+                     * joining operation was successful since we can't guarantee that the chosen room has
+                     * space for new players due to the possibility of multiple pending join requests
+                     * in its message queue. At this point, we have only succesfully found a
+                     * *potentially* joinable room for the user. Therefore, we send the final Success
+                     * message from the room's AddPlayer message handler itself. */
+                    Ok(())
+                } else if let Some(RoomInfo { addr, .. }) = self.public_rooms.get(&code) {
+                    addr.do_send(AddPlayer { info });
+                    Ok(())
+                } else {
+                    Err(JoinRoomError::RoomNotFound)
+                }
+            } else {
+                /* Otherwise, the user probably wants to join a random room.
+                 * This might involve complex matchmaking algorithms which should be injected here
+                 * as necessary.
+                 * By default we add the player to the first open public room we can find.
+                 */
+                self.public_matching_pool
+                    .iter()
+                    .find(|_| /* match criteria */ true)
+                    .map_or_else(
+                        || {
+                            ctx.address().do_send(CreateRoom {
+                                server_id: msg.server_id,
+                                public: true,
+                            });
+                        },
+                        |(_, room)| {
+                            room.addr.do_send(AddPlayer { info });
+                        },
+                    );
+                Ok(())
+            }
+        } else {
+            Err(JoinRoomError::NotSignedIn)
+        };
+        result
+    }
 }
 
 #[derive(Message)]
@@ -145,7 +219,13 @@ impl Handler<CreateRoom> for Server {
             )
             .start();
             data.room = Some(room.clone());
-            todo!("send message to client updating room");
+            let room = RoomInfo {
+                code: code.clone(),
+                addr: room,
+            };
+            data.addr.do_send(crate::session::JoinRoomResult {
+                room: Ok((code.clone(), room.addr.clone())),
+            });
             if msg.public {
                 self.public_rooms.insert(code, room);
             }

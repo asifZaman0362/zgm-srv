@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use crate::server::{DeregisterSession, RegisterSession, Server};
 
 pub mod message;
+use crate::room::Room;
 use crate::session::message::RemoveReason;
 use message::{IncomingMessage, OutgoingMessage};
 
@@ -23,6 +24,7 @@ pub struct Session {
     hb: Instant,
     server: Addr<Server>,
     reconnection_timer: Option<SpawnHandle>,
+    room: Option<Addr<Room>>,
 }
 
 impl Session {
@@ -33,6 +35,7 @@ impl Session {
             server,
             server_id,
             reconnection_timer: None,
+            room: None,
         }
     }
     /* @brief checks for ping every 5 seconds.
@@ -137,5 +140,56 @@ impl Handler<Stop> for Session {
             ctx.cancel_future(spawn_handle);
         }
         ctx.stop();
+    }
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct JoinRoomResult {
+    pub room: Result<(String, Addr<Room>), crate::room::JoinRoomError>,
+}
+
+impl Handler<JoinRoomResult> for Session {
+    type Result = ();
+    fn handle(&mut self, msg: JoinRoomResult, ctx: &mut Self::Context) -> Self::Result {
+        let result = match msg.room {
+            Ok((code, addr)) => {
+                self.room = Some(addr);
+                OutgoingMessage::Result {
+                    result_of: message::ResultOf::JoinRoom,
+                    success: true,
+                    info: code,
+                }
+            }
+            Err(err) => OutgoingMessage::Result {
+                result_of: message::ResultOf::JoinRoom,
+                success: false,
+                info: serde_json::to_string(&err)
+                    .expect("failed to serialize room join failure reason"),
+            },
+        };
+        let result = serde_json::to_string(&result).expect("Failed to serialise result!");
+        ctx.text(result);
+    }
+}
+
+/* This should only be used when forcefully removing a client from a room due to reasons such
+ * disconnection, room expiry, game over, etc. Willingly leaving a room should be handled more
+ * gracefully by the client by clearing the self.room field before requesting to be removed from a
+ * room.
+ * */
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ClearRoom {
+    pub reason: RemoveReason
+}
+
+impl Handler<ClearRoom> for Session {
+    type Result = ();
+    fn handle(&mut self, msg: ClearRoom, ctx: &mut Self::Context) -> Self::Result {
+        let _ = self.room.take();
+        let msg = OutgoingMessage::RemoveFromRoom(msg.reason);
+        let msg = serde_json::to_string(&msg).unwrap();
+        ctx.text(msg);
     }
 }
