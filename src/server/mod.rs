@@ -1,8 +1,8 @@
 use crate::room::{self, AddPlayer, JoinRoomError, PlayerInRoom, Room};
 use crate::session::Session;
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message};
+use fxhash::FxHashMap;
 use rand::Rng;
-use std::collections::HashMap;
 
 pub mod http;
 
@@ -17,39 +17,46 @@ struct RoomInfo {
     addr: Addr<Room>,
 }
 
+// Choice of hashing functions are machine dependant in some cases so it is advised to do your own
+// research before picking one (we use multiple here for different purposes).
 pub struct Server {
     /* A hashmap of sessions keyed by their server id.
      * See: session/mod.rs for more information on server ids.
+     * NOTE: this uses FxHash instead of the standard hash function because this
+     * does not need to cryptographic AND I have found that fxhash is the fastest when hashing
+     * integers.
      */
-    sessions: HashMap<u128, SessionData>,
+    sessions: FxHashMap<u128, SessionData>,
     /* An inverted session map, used for quickly accessing session information using their client
      * ids which is useful for reconnections / API queries. */
-    sessions_inverted: HashMap<String, u128>,
+    sessions_inverted: ahash::HashMap<String, u128>,
     /* List of all public rooms that *CANNOT* be joined, either due to having been filled completely
      * or due to having games that are currently in progress.
      * NOTE: Rooms must notify the server that they are no longer available for joining when such an
      * event occurs (Room being Filled, Game Starting, etc).
      * Same applies to private rooms.
      */
-    public_rooms: HashMap<String, RoomInfo>,
+    public_rooms: ahash::HashMap<String, RoomInfo>,
     /* List of all private rooms that *CANNOT* be joined, due to similar reasons as public room
      * inavailability */
-    private_rooms: HashMap<String, RoomInfo>,
+    private_rooms: ahash::HashMap<String, RoomInfo>,
     // List of all public rooms available for matching
-    public_matching_pool: HashMap<String, RoomInfo>,
+    public_matching_pool: ahash::HashMap<String, RoomInfo>,
     // List of all private rooms that can be joined
-    private_matching_pool: HashMap<String, RoomInfo>,
+    private_matching_pool: ahash::HashMap<String, RoomInfo>,
 }
+
+use crate::utils::{new_fast_hashmap, new_fx_hashmap};
 
 impl Server {
     pub fn new() -> Self {
         Self {
-            sessions: HashMap::new(),
-            sessions_inverted: HashMap::new(),
-            public_rooms: HashMap::new(),
-            private_rooms: HashMap::new(),
-            private_matching_pool: HashMap::new(),
-            public_matching_pool: HashMap::new(),
+            sessions: new_fx_hashmap(65536),
+            sessions_inverted: new_fast_hashmap(65536),
+            public_rooms: new_fast_hashmap(1 << 12),
+            private_rooms: new_fast_hashmap(1 << 12),
+            private_matching_pool: new_fast_hashmap(1 << 12),
+            public_matching_pool: new_fast_hashmap(1 << 12),
         }
     }
 }

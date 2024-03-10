@@ -5,7 +5,6 @@ use crate::session::{
     SerializedMessage, Session,
 };
 use actix::{Actor, ActorContext, Addr, Context, Handler, Message};
-use std::collections::HashMap;
 
 pub struct PlayerInRoom {
     pub id: String,
@@ -14,7 +13,7 @@ pub struct PlayerInRoom {
 }
 
 pub struct Room {
-    players: HashMap<Addr<Session>, PlayerInRoom>,
+    players: ahash::HashMap<Addr<Session>, PlayerInRoom>,
     game: Option<Game>,
     leader: String,
     code: String,
@@ -34,7 +33,8 @@ impl Room {
             id: leader_id.clone(),
             addr: leader_addr.clone(),
         };
-        let players = HashMap::from([(leader_addr, leader)]);
+        let mut players = crate::utils::new_fast_hashmap(max_player_count);
+        players.insert(leader_addr, leader);
         Self {
             players,
             game: None,
