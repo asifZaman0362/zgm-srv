@@ -181,7 +181,7 @@ impl Handler<JoinRoomResult> for Session {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct ClearRoom {
-    pub reason: RemoveReason
+    pub reason: RemoveReason,
 }
 
 impl Handler<ClearRoom> for Session {
@@ -191,5 +191,22 @@ impl Handler<ClearRoom> for Session {
         let msg = OutgoingMessage::RemoveFromRoom(msg.reason);
         let msg = serde_json::to_string(&msg).unwrap();
         ctx.text(msg);
+    }
+}
+
+#[derive(Message, serde::Serialize)]
+#[rtype(result = "()")]
+pub struct RestoreState {
+    pub code: String,
+    pub game: Option<crate::game::SerializedState>,
+}
+
+impl Handler<RestoreState> for Session {
+    type Result = ();
+    fn handle(&mut self, msg: RestoreState, ctx: &mut Self::Context) -> Self::Result {
+        match serde_json::to_string(&msg) {
+            Ok(res) => ctx.text(res),
+            Err(err) => log::error!("game state serialization failed! {err}"),
+        }
     }
 }

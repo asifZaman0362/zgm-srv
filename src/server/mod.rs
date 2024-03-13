@@ -1,4 +1,4 @@
-use crate::room::{self, AddPlayer, JoinRoomError, PlayerInRoom, Room};
+use crate::room::{self, AddPlayer, ClientReconnection, JoinRoomError, PlayerInRoom, Room};
 use crate::session::Session;
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use fxhash::FxHashMap;
@@ -42,8 +42,6 @@ pub struct Server {
     private_rooms: ahash::HashMap<String, RoomInfo>,
     // List of all public rooms available for matching
     public_matching_pool: ahash::HashMap<String, RoomInfo>,
-    // List of all private rooms that can be joined
-    private_matching_pool: ahash::HashMap<String, RoomInfo>,
 }
 
 use crate::utils::{new_fast_hashmap, new_fx_hashmap};
@@ -55,7 +53,6 @@ impl Server {
             sessions_inverted: new_fast_hashmap(65536),
             public_rooms: new_fast_hashmap(1 << 12),
             private_rooms: new_fast_hashmap(1 << 12),
-            private_matching_pool: new_fast_hashmap(1 << 12),
             public_matching_pool: new_fast_hashmap(1 << 12),
         }
     }
@@ -94,6 +91,11 @@ impl Handler<RegisterSession> for Server {
                     /* This is a reconnection, let the room that the client was in before disconnecting
                      * (if any) know of the updated session address. */
                     if let Some(room) = &data.room {
+                        room.do_send(ClientReconnection {
+                            addr: msg.addr,
+                            id: msg.id,
+                            server_id: msg.server_id,
+                        });
                         todo!("send client update message");
                     }
                     /* We force the older session actor to terminate
@@ -133,8 +135,8 @@ impl Handler<DeregisterSession> for Server {
         if let Some(data) = self.sessions.remove(&msg.server_id) {
             if let Some(room) = data.room {
                 room.do_send(room::RemovePlayer {
-                    addr: msg.address,
                     reason: msg.reason,
+                    server_id: msg.server_id,
                 });
                 todo!("send client disconnection message to room!");
             }
@@ -156,13 +158,14 @@ impl Handler<JoinRoom> for Server {
         let result = if let Some(player) = self.sessions.get(&msg.server_id) {
             let info = PlayerInRoom {
                 id: player.id.clone(),
-                addr: player.addr.to_owned(),
+                addr: player.addr.clone(),
             };
+            let server_id = msg.server_id;
             /* If the message contains a room code, then we look for that room in both private and
              * public room pools. */
             if let Some(code) = msg.code {
                 if let Some(RoomInfo { addr, .. }) = self.private_rooms.get(&code) {
-                    addr.do_send(AddPlayer { info });
+                    addr.do_send(AddPlayer { info, server_id });
                     /* Even though this is an Ok() value, it doesnt necessary mean that the room
                      * joining operation was successful since we can't guarantee that the chosen room has
                      * space for new players due to the possibility of multiple pending join requests
@@ -171,7 +174,7 @@ impl Handler<JoinRoom> for Server {
                      * message from the room's AddPlayer message handler itself. */
                     Ok(())
                 } else if let Some(RoomInfo { addr, .. }) = self.public_rooms.get(&code) {
-                    addr.do_send(AddPlayer { info });
+                    addr.do_send(AddPlayer { info, server_id });
                     Ok(())
                 } else {
                     Err(JoinRoomError::RoomNotFound)
@@ -193,7 +196,7 @@ impl Handler<JoinRoom> for Server {
                             });
                         },
                         |(_, room)| {
-                            room.addr.do_send(AddPlayer { info });
+                            room.addr.do_send(AddPlayer { info, server_id });
                         },
                     );
                 Ok(())
@@ -222,7 +225,9 @@ impl Handler<CreateRoom> for Server {
                 ctx.address(),
                 data.id.clone(),
                 data.addr.clone(),
+                msg.server_id,
                 5,
+                msg.public,
             )
             .start();
             data.room = Some(room.clone());

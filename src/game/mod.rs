@@ -1,7 +1,12 @@
 use crate::room::{PlayerInRoom, Room};
 use crate::session::Session;
 use actix::{Actor, Addr};
+use serde::Serialize;
 use std::collections::HashMap;
+
+/* Game state for client side state restoration upon reconnection */
+#[derive(Serialize)]
+pub struct SerializedState {}
 
 struct PlayerState {
     addr: Addr<Session>,
@@ -55,10 +60,20 @@ impl Game {
     pub fn stop(&mut self, ctx: &mut <Room as Actor>::Context) {
         self.controller.on_end(ctx);
     }
+    pub fn get_state(&self) -> SerializedState {
+        SerializedState {}
+    }
 }
 
+#[derive(Clone, Copy)]
 pub enum GameMode {
     Standard,
+}
+
+impl Default for GameMode {
+    fn default() -> Self {
+        GameMode::Standard
+    }
 }
 
 /* @brief Game modes can be defined using a game controller trait which exhibits necessary behaviour,

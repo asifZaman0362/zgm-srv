@@ -1,10 +1,10 @@
-use crate::game::Game;
+use crate::game::{Game, GameMode};
 use crate::server::Server;
 use crate::session::{
     message::{OutgoingMessage, RemoveReason},
-    SerializedMessage, Session,
+    RestoreState, SerializedMessage, Session,
 };
-use actix::{Actor, ActorContext, Addr, Context, Handler, Message};
+use actix::{Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message};
 
 pub struct PlayerInRoom {
     pub id: String,
@@ -12,13 +12,28 @@ pub struct PlayerInRoom {
     // extra_info: Info
 }
 
+pub struct GameConfigOptions {
+    mode: GameMode,
+    // Add extra options
+}
+
+impl Default for GameConfigOptions {
+    fn default() -> Self {
+        Self {
+            mode: Default::default(),
+        }
+    }
+}
+
 pub struct Room {
-    players: ahash::HashMap<Addr<Session>, PlayerInRoom>,
+    players: fxhash::FxHashMap<u128, PlayerInRoom>,
     game: Option<Game>,
     leader: String,
     code: String,
     max_player_count: usize,
     server: Addr<Server>, // further configuration / extra state
+    public: bool,
+    config: GameConfigOptions,
 }
 
 impl Room {
@@ -27,14 +42,16 @@ impl Room {
         server: Addr<Server>,
         leader_id: String,
         leader_addr: Addr<Session>,
+        leader_server_id: u128,
         max_player_count: usize,
+        public: bool,
     ) -> Self {
         let leader = PlayerInRoom {
             id: leader_id.clone(),
-            addr: leader_addr.clone(),
+            addr: leader_addr,
         };
-        let mut players = crate::utils::new_fast_hashmap(max_player_count);
-        players.insert(leader_addr, leader);
+        let mut players = crate::utils::new_fx_hashmap(max_player_count);
+        players.insert(leader_server_id, leader);
         Self {
             players,
             game: None,
@@ -42,7 +59,17 @@ impl Room {
             code,
             max_player_count,
             server,
+            public,
+            config: Default::default(),
         }
+    }
+    fn start_game(&mut self, ctx: &mut <Self as Actor>::Context) {
+        self.game = Some(Game::new(
+            ctx.address(),
+            self.players.values(),
+            self.config.mode,
+        ));
+        todo!("inform players that game has started!");
     }
 }
 
@@ -52,7 +79,7 @@ impl Actor for Room {
         if let Some(game) = &mut self.game {
             game.stop(ctx)
         }
-        for (addr, _) in self.players.iter() {
+        for (_, PlayerInRoom { addr, .. }) in self.players.iter() {
             addr.do_send(SerializedMessage(OutgoingMessage::RemoveFromRoom(
                 RemoveReason::RoomClosed,
             )));
@@ -65,13 +92,14 @@ pub type RoomInfo = ();
 #[derive(Message)]
 #[rtype(result = "Result<RoomInfo, JoinRoomError>")]
 pub struct AddPlayer {
+    pub server_id: u128,
     pub info: PlayerInRoom,
 }
 
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct RemovePlayer {
-    pub addr: Addr<Session>,
+    pub server_id: u128,
     pub reason: RemoveReason,
 }
 
@@ -100,10 +128,10 @@ impl Handler<AddPlayer> for Room {
         } else if self.players.len() > self.max_player_count {
             Err(JoinRoomError::RoomFull)
         } else {
-            if self.players.get(&msg.info.addr).is_some() {
+            if self.players.get(&msg.server_id).is_some() {
                 Err(JoinRoomError::AlreadyInRoom)
             } else {
-                self.players.insert(msg.info.addr.clone(), msg.info);
+                self.players.insert(msg.server_id, msg.info);
                 Ok(())
             }
         };
@@ -121,7 +149,7 @@ impl Handler<RemovePlayer> for Room {
                  * leave. */
             }
             reason => {
-                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.addr) {
+                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.server_id) {
                     addr.do_send(crate::session::ClearRoom { reason });
                 }
             }
@@ -142,5 +170,73 @@ impl Handler<CloseRoom> for Room {
     type Result = ();
     fn handle(&mut self, _: CloseRoom, ctx: &mut Self::Context) -> Self::Result {
         ctx.stop();
+    }
+}
+
+/* When the client reconnects, it gets a new session address due
+ * to having reconnected on a different stream, therefore we must
+ * update the stale client address in the room the client was in before
+ * disconnecting. This message also sends state information to the
+ * reconnecting client address for state restoration. */
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct ClientReconnection {
+    pub addr: Addr<Session>,
+    pub id: String,
+    pub server_id: u128,
+}
+
+impl Handler<ClientReconnection> for Room {
+    type Result = ();
+    fn handle(&mut self, msg: ClientReconnection, _: &mut Self::Context) -> Self::Result {
+        match self
+            .players
+            .iter()
+            .find(|(_, PlayerInRoom { id, .. })| id == &msg.id)
+            .map(|(id, ..)| *id)
+        {
+            Some(id) => {
+                let mut player = self.players.remove(&id).unwrap();
+                msg.addr.do_send(RestoreState {
+                    code: self.code.clone(),
+                    game: self.game.as_ref().map(|g| g.get_state()),
+                });
+                player.addr = msg.addr;
+                self.players.insert(msg.server_id, player);
+            }
+            None => {}
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+pub enum StartGameError {
+    GameAlreadyRunning,
+    NotLeader,
+}
+
+#[derive(Message)]
+#[rtype(result = "Result<(), StartGameError>")]
+pub struct RequestStart {
+    pub id: String,
+}
+
+impl Handler<RequestStart> for Room {
+    type Result = Result<(), StartGameError>;
+    fn handle(&mut self, msg: RequestStart, ctx: &mut Self::Context) -> Self::Result {
+        if self.game.is_some() {
+            Err(StartGameError::GameAlreadyRunning)
+        } else {
+            if self.public {
+                Ok(())
+            } else {
+                if self.leader == msg.id {
+                    self.start_game(ctx);
+                    Ok(())
+                } else {
+                    Err(StartGameError::NotLeader)
+                }
+            }
+        }
     }
 }
