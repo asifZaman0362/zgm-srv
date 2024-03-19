@@ -88,13 +88,12 @@ impl Actor for Room {
                 RemoveReason::RoomClosed,
             )));
         }
+        self.server.do_send(crate::server::OnRoomClosed(self.code.clone()));
     }
 }
 
-pub type RoomInfo = ();
-
 #[derive(Message)]
-#[rtype(result = "Result<RoomInfo, JoinRoomError>")]
+#[rtype(result = "Result<(), JoinRoomError>")]
 pub struct AddPlayer {
     pub server_id: u128,
     pub info: PlayerInRoom,
@@ -121,7 +120,7 @@ pub enum JoinRoomError {
 }
 
 impl Handler<AddPlayer> for Room {
-    type Result = Result<RoomInfo, JoinRoomError>;
+    type Result = Result<(), JoinRoomError>;
     fn handle(&mut self, msg: AddPlayer, _: &mut Self::Context) -> Self::Result {
         /* The default behaviour is to not allow players to join a room while a game is currently
          * in progress in that same room, however it may be deserible to add players to an ongoing
