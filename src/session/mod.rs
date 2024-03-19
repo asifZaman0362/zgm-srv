@@ -13,7 +13,7 @@ use message::{IncomingMessage, OutgoingMessage};
 
 const RECONNECTION_TIME_LIMIT: u64 = 15;
 const HB_CHECK_INTERVAL: u64 = 5;
-const HB_TIMEOUT: u64 = 2;
+const HB_TIME_LIMIT: u64 = 2;
 
 /* @brief Client session responsible for keeping track of client identity,
  * handling client messages, etc
@@ -44,10 +44,12 @@ impl Session {
      */
     fn heartbeat(&mut self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(Duration::from_secs(HB_CHECK_INTERVAL), |act, ctx| {
-            if Instant::now().duration_since(act.hb).as_secs() >= HB_TIMEOUT {
+            if Instant::now().duration_since(act.hb).as_secs() >= HB_TIME_LIMIT {
                 act.reconnection_timer = Some(ctx.run_later(
                     Duration::from_secs(RECONNECTION_TIME_LIMIT),
                     |_, ctx| {
+                        // This task is cancelled when the client reconnects with another stream.
+                        // See [Stop]
                         ctx.stop();
                     },
                 ));
@@ -68,6 +70,20 @@ impl Session {
                     });
                 }
             }
+            IncomingMessage::Logout => {
+                if let Some(id) = self.id.take() {
+                    let server_id = self.server_id;
+                    let address = ctx.address();
+                    let reason = RemoveReason::Logout;
+                    self.server.do_send(DeregisterSession {
+                        server_id,
+                        id,
+                        address,
+                        reason,
+                    });
+                }
+                ctx.stop();
+            }
             _ => todo!("handle other messages"),
         }
     }
@@ -82,6 +98,9 @@ impl Actor for Session {
         if let Some(spawn_handle) = self.reconnection_timer {
             ctx.cancel_future(spawn_handle);
         }
+        // Upon normal termination, the sessions id should be removed before disconnection,
+        // if not done so, it means something probably went wrong and therefore should be notified
+        // to the server and to any related rooms
         if let Some(id) = self.id.take() {
             self.server.do_send(DeregisterSession {
                 server_id: self.server_id,
@@ -129,6 +148,10 @@ impl Handler<SerializedMessage> for Session {
     }
 }
 
+/// Sent by the server in the event where the client reconnects from a different stream.
+/// This message is required because the older session controller (the one receiving this message)
+/// might have a reconnection timer, which upon evaluating will result in the permanent removal of
+/// the client from any rooms they might be in before losing connection.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct Stop;
@@ -136,9 +159,8 @@ pub struct Stop;
 impl Handler<Stop> for Session {
     type Result = ();
     fn handle(&mut self, _: Stop, ctx: &mut Self::Context) -> Self::Result {
-        if let Some(spawn_handle) = self.reconnection_timer {
-            ctx.cancel_future(spawn_handle);
-        }
+        // ID should be removed upon normal termination
+        self.id.take();
         ctx.stop();
     }
 }
@@ -155,10 +177,14 @@ impl Handler<JoinRoomResult> for Session {
         let result = match msg.room {
             Ok((code, addr)) => {
                 self.room = Some(addr);
+                self.server.do_send(crate::server::UpdateSessionRoomInfo(
+                    self.server_id,
+                    Some(code.clone()),
+                ));
                 OutgoingMessage::Result {
                     result_of: message::ResultOf::JoinRoom,
                     success: true,
-                    info: code,
+                    info: code.clone(),
                 }
             }
             Err(err) => OutgoingMessage::Result {
@@ -191,6 +217,8 @@ impl Handler<ClearRoom> for Session {
         let msg = OutgoingMessage::RemoveFromRoom(msg.reason);
         let msg = serde_json::to_string(&msg).unwrap();
         ctx.text(msg);
+        self.server
+            .do_send(crate::server::UpdateSessionRoomInfo(self.server_id, None));
     }
 }
 

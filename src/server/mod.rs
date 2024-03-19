@@ -13,8 +13,9 @@ struct SessionData {
 }
 
 struct RoomInfo {
-    code: String,
     addr: Addr<Room>,
+    playing: bool,
+    full: bool,
 }
 
 // Choice of hashing functions are machine dependant in some cases so it is advised to do your own
@@ -81,9 +82,25 @@ pub struct DeregisterSession {
 
 impl Handler<RegisterSession> for Server {
     type Result = ();
-    fn handle(&mut self, msg: RegisterSession, _: &mut Self::Context) -> Self::Result {
-        if let Some(_) = self.sessions.get(&msg.server_id) {
-            log::error!("cannot update client ID while still logged in!");
+    fn handle(&mut self, msg: RegisterSession, ctx: &mut Self::Context) -> Self::Result {
+        if let Some(session) = self.sessions.get(&msg.server_id) {
+            if session.addr == msg.addr {
+                log::warn!("probably a mistake on the users end");
+            } else {
+                log::error!("cannot update client ID while still logged in!");
+                session.addr.do_send(crate::session::SerializedMessage(
+                    crate::session::message::OutgoingMessage::ForceDisconnect(
+                        crate::session::message::RemoveReason::IdMismatch,
+                    ),
+                ));
+                session.addr.do_send(crate::session::Stop);
+                ctx.address().do_send(DeregisterSession {
+                    reason: crate::session::message::RemoveReason::IdMismatch,
+                    id: msg.id,
+                    address: msg.addr,
+                    server_id: msg.server_id,
+                });
+            }
         } else {
             if let Some(session) = self.sessions_inverted.get_mut(&msg.id) {
                 // We remove the older session entry from the session map
@@ -164,18 +181,38 @@ impl Handler<JoinRoom> for Server {
             /* If the message contains a room code, then we look for that room in both private and
              * public room pools. */
             if let Some(code) = msg.code {
-                if let Some(RoomInfo { addr, .. }) = self.private_rooms.get(&code) {
+                if let Some(RoomInfo {
+                    addr,
+                    playing,
+                    full,
+                    ..
+                }) = self.private_rooms.get(&code)
+                {
+                    if *playing {
+                        Err(JoinRoomError::GameInProgress)
+                    } else if *full {
+                        Err(JoinRoomError::RoomFull)
+                    } else {
+                        addr.do_send(AddPlayer { info, server_id });
+                        /* Even though this is an Ok() value, it doesnt necessarily mean that the room
+                         * joining operation was successful since we can't guarantee that the chosen room has
+                         * space for new players due to the possibility of multiple pending join requests
+                         * in its message queue. At this point, we have only succesfully found a
+                         * *potentially* joinable room for the user. Therefore, we send the final Success
+                         * message from the room's AddPlayer message handler itself. */
+                        Ok(())
+                    }
+                } else if let Some(RoomInfo { addr, .. }) = self.public_matching_pool.get(&code) {
                     addr.do_send(AddPlayer { info, server_id });
-                    /* Even though this is an Ok() value, it doesnt necessary mean that the room
-                     * joining operation was successful since we can't guarantee that the chosen room has
-                     * space for new players due to the possibility of multiple pending join requests
-                     * in its message queue. At this point, we have only succesfully found a
-                     * *potentially* joinable room for the user. Therefore, we send the final Success
-                     * message from the room's AddPlayer message handler itself. */
                     Ok(())
-                } else if let Some(RoomInfo { addr, .. }) = self.public_rooms.get(&code) {
-                    addr.do_send(AddPlayer { info, server_id });
-                    Ok(())
+                } else if let Some(RoomInfo { playing, full, .. }) = self.public_rooms.get(&code) {
+                    if *playing {
+                        Err(JoinRoomError::GameInProgress)
+                    } else if *full {
+                        Err(JoinRoomError::RoomFull)
+                    } else {
+                        panic!("A public room cannot be out of the matching pool unless its full or has a game running in it!");
+                    }
                 } else {
                     Err(JoinRoomError::RoomNotFound)
                 }
@@ -232,8 +269,9 @@ impl Handler<CreateRoom> for Server {
             .start();
             data.room = Some(room.clone());
             let room = RoomInfo {
-                code: code.clone(),
                 addr: room,
+                full: false,
+                playing: false,
             };
             data.addr.do_send(crate::session::JoinRoomResult {
                 room: Ok((code.clone(), room.addr.clone())),
@@ -241,6 +279,80 @@ impl Handler<CreateRoom> for Server {
             if msg.public {
                 self.public_rooms.insert(code, room);
             }
+        }
+    }
+}
+
+pub enum RoomUnavailablityReason {
+    Full,
+    GameStarted,
+}
+
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct UpdateRoomMatchAvailability {
+    pub code: String,
+    pub reason: RoomUnavailablityReason,
+}
+
+impl Handler<UpdateRoomMatchAvailability> for Server {
+    type Result = ();
+    fn handle(&mut self, msg: UpdateRoomMatchAvailability, _: &mut Self::Context) -> Self::Result {
+        let UpdateRoomMatchAvailability { code, reason } = msg;
+        if let Some(mut room) = self.public_matching_pool.remove(&code) {
+            match reason {
+                RoomUnavailablityReason::Full => room.full = true,
+                RoomUnavailablityReason::GameStarted => room.playing = true,
+            }
+            self.public_rooms.insert(code, room);
+        } else if let Some(room) = self.private_rooms.get_mut(&code) {
+            match reason {
+                RoomUnavailablityReason::Full => room.full = true,
+                RoomUnavailablityReason::GameStarted => room.playing = true,
+            }
+        }
+    }
+}
+
+/// Rooms notify the server of their stopping so that the server can remove said room from its
+/// matching queue.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct OnRoomClosed(pub String);
+
+impl Handler<OnRoomClosed> for Server {
+    type Result = ();
+    fn handle(&mut self, msg: OnRoomClosed, _: &mut Self::Context) -> Self::Result {
+        if self.public_rooms.remove(&msg.0).is_none() {
+            if self.public_matching_pool.remove(&msg.0).is_none() {
+                self.private_rooms.remove(&msg.0);
+            }
+        }
+    }
+}
+
+/// Sessions notify the server when they join or leave a room.
+#[derive(Message)]
+#[rtype(result = "()")]
+pub struct UpdateSessionRoomInfo(pub u128, pub Option<String>);
+
+impl Handler<UpdateSessionRoomInfo> for Server {
+    type Result = ();
+    fn handle(&mut self, msg: UpdateSessionRoomInfo, _: &mut Self::Context) -> Self::Result {
+        if let Some(session_info) = self.sessions.get_mut(&msg.0) {
+            session_info.room = msg.1.map(|code| {
+                self.public_rooms
+                    .get(&code)
+                    .unwrap_or(
+                        self.public_matching_pool.get(&code).unwrap_or(
+                            self.private_rooms
+                                .get(&code)
+                                .expect("Room must be in one of the pools"),
+                        ),
+                    )
+                    .addr
+                    .clone()
+            });
         }
     }
 }

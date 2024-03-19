@@ -1,5 +1,5 @@
 use crate::game::{Game, GameMode};
-use crate::server::Server;
+use crate::server::{RoomUnavailablityReason, Server, UpdateRoomMatchAvailability};
 use crate::session::{
     message::{OutgoingMessage, RemoveReason},
     RestoreState, SerializedMessage, Session,
@@ -69,6 +69,10 @@ impl Room {
             self.players.values(),
             self.config.mode,
         ));
+        self.server.do_send(UpdateRoomMatchAvailability {
+            code: self.code.clone(),
+            reason: RoomUnavailablityReason::GameStarted,
+        });
         todo!("inform players that game has started!");
     }
 }
@@ -135,6 +139,12 @@ impl Handler<AddPlayer> for Room {
                 Ok(())
             }
         };
+        if self.players.len() > self.max_player_count {
+            self.server.do_send(UpdateRoomMatchAvailability {
+                code: self.code.clone(),
+                reason: RoomUnavailablityReason::Full,
+            });
+        }
         result
     }
 }

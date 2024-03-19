@@ -4,27 +4,28 @@ use actix::{Actor, Addr};
 use serde::Serialize;
 use std::collections::HashMap;
 
-/* Game state for client side state restoration upon reconnection */
+/// Game state for client side state restoration upon reconnection */
 #[derive(Serialize)]
 pub struct SerializedState {}
 
+/// State tied to individual players such as their score
 struct PlayerState {
     addr: Addr<Session>,
     id: String,
+    score: usize,
 }
 
-/* @brief Common game state, that apply to all game modes
- */
+/// Common game state, that applies to all game modes
 struct GameState {
     players: HashMap<Addr<Session>, PlayerState>,
 }
 
 pub struct Game {
-    // Common game state, that apply to all game modes
+    /// Common game state, that applies to all game modes
     state: GameState,
-    // Address of the parent room that the game is running in
+    /// Address([`Addr`]) of the parent room the game is running in
     room: Addr<Room>,
-    // Mode specific game controller, this is where the real action happens
+    /// Mode specific game controller. This is where the real action happens
     controller: Box<dyn GameController<Context = <Room as Actor>::Context>>,
 }
 
@@ -33,6 +34,7 @@ impl From<&PlayerInRoom> for PlayerState {
         Self {
             addr: value.addr.clone(),
             id: value.id.clone(),
+            score: Default::default()
         }
     }
 }
@@ -65,6 +67,7 @@ impl Game {
     }
 }
 
+/// Available game modes
 #[derive(Clone, Copy)]
 pub enum GameMode {
     Standard,
@@ -76,20 +79,22 @@ impl Default for GameMode {
     }
 }
 
-/* @brief Game modes can be defined using a game controller trait which exhibits necessary behaviour,
- * the details of which can be dynamic. Note that the following trait only provides a basic outline
- * which might not always be applicable to all use cases. The design of this trait is entirely
- * dependant on the game's design.
- */
+/// Game Controller interface for game logic
+///
+/// Game modes can be defined using a game controller trait which exhibits necessary behaviour,
+/// the details of which can be dynamic. Note that the following trait only provides a basic outline
+/// which might not always be applicable to all use cases. The design of this trait is entirely
+/// dependant on the game's design.
 pub trait GameController {
+    /// The [`actix::Context`] of the parent [`Actor`]
     type Context;
+    /// Called when the game is first started
     fn on_start(&self, ctx: &mut Self::Context);
+    /// Called when the game ends
     fn on_end(&self, ctx: &mut Self::Context);
-    // Add more functions
 }
 
-/* @brief Example implementation of a game mode
- * */
+/// Example implementation of a game mode
 struct StandardGame {}
 
 impl GameController for StandardGame {

@@ -4,6 +4,7 @@ use serde::{Serialize, Deserialize};
 pub enum IncomingMessage {
     Login(String),
     JoinRoom(String),
+    Logout,
     // Add more types here
 }
 
@@ -12,7 +13,8 @@ pub enum RemoveReason {
     RoomClosed,
     Logout,
     Disconnected,
-    LeaveRequested
+    LeaveRequested,
+    IdMismatch
 }
 
 #[derive(Serialize)]
@@ -23,6 +25,7 @@ pub enum ResultOf {
 #[derive(Serialize)]
 pub enum OutgoingMessage {
     RemoveFromRoom(RemoveReason),
+    ForceDisconnect(RemoveReason),
     GameStarted,
     GameEnd,
     /* As much as it hurts my soul, we cant use rust like enum types here because we cant 
