@@ -1,5 +1,5 @@
 use crate::room::{PlayerInRoom, Room};
-use crate::session::Session;
+use crate::session::{Session, UserId};
 use actix::{Actor, Addr};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -11,7 +11,7 @@ pub struct SerializedState {}
 /// State tied to individual players such as their score
 struct PlayerState {
     addr: Addr<Session>,
-    id: String,
+    id: UserId,
     score: usize,
 }
 

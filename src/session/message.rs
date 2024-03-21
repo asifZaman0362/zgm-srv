@@ -1,9 +1,10 @@
 use serde::{Serialize, Deserialize};
+use std::sync::Arc;
 
 #[derive(Deserialize)]
-pub enum IncomingMessage {
-    Login(String),
-    JoinRoom(String),
+pub enum IncomingMessage<'a> {
+    Login(&'a str),
+    JoinRoom(&'a str),
     Logout,
     // Add more types here
 }
@@ -33,7 +34,7 @@ pub enum OutgoingMessage {
     Result {
         result_of: ResultOf,
         success: bool,
-        info: String
+        info: Arc<str>
     }
     // Add more types here
 }

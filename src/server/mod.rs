@@ -1,13 +1,14 @@
 use crate::room::{self, AddPlayer, ClientReconnection, JoinRoomError, PlayerInRoom, Room};
-use crate::session::Session;
+use crate::session::{Session, UserId};
 use actix::{Actor, Addr, AsyncContext, Context, Handler, Message};
 use fxhash::FxHashMap;
 use rand::Rng;
+use std::sync::Arc;
 
 pub mod http;
 
 struct SessionData {
-    id: String,
+    id: UserId,
     room: Option<Addr<Room>>,
     addr: Addr<Session>,
 }
@@ -18,31 +19,32 @@ struct RoomInfo {
     full: bool,
 }
 
+pub const ROOM_CODE_LENGTH: usize = 6;
+pub type RoomCode = Arc<str>;
+
 // Choice of hashing functions are machine dependant in some cases so it is advised to do your own
 // research before picking one (we use multiple here for different purposes).
+/// Main server actor responsible for managing all sessions and rooms.
 pub struct Server {
-    /* A hashmap of sessions keyed by their server id.
-     * See: session/mod.rs for more information on server ids.
-     * NOTE: this uses FxHash instead of the standard hash function because this
-     * does not need to cryptographic AND I have found that fxhash is the fastest when hashing
-     * integers.
-     */
+    /// A hashmap of sessions keyed by their server id.
+    /// See: session/mod.rs for more information on server ids.
+    /// NOTE: this uses FxHash instead of the standard hash function because this
+    /// does not need to cryptographic AND I have found that fxhash is the fastest when hashing
+    /// integers.
     sessions: FxHashMap<u128, SessionData>,
-    /* An inverted session map, used for quickly accessing session information using their client
-     * ids which is useful for reconnections / API queries. */
-    sessions_inverted: ahash::HashMap<String, u128>,
-    /* List of all public rooms that *CANNOT* be joined, either due to having been filled completely
-     * or due to having games that are currently in progress.
-     * NOTE: Rooms must notify the server that they are no longer available for joining when such an
-     * event occurs (Room being Filled, Game Starting, etc).
-     * Same applies to private rooms.
-     */
-    public_rooms: ahash::HashMap<String, RoomInfo>,
-    /* List of all private rooms that *CANNOT* be joined, due to similar reasons as public room
-     * inavailability */
-    private_rooms: ahash::HashMap<String, RoomInfo>,
-    // List of all public rooms available for matching
-    public_matching_pool: ahash::HashMap<String, RoomInfo>,
+    /// An inverted session map, used for quickly accessing session information using their client
+    /// ids which is useful for reconnections / API queries. */
+    sessions_inverted: ahash::HashMap<Arc<str>, u128>,
+    /// List of all public rooms that *CANNOT* be joined, either due to having been filled completely
+    /// or due to having games that are currently in progress.
+    /// NOTE: Rooms must notify the server that they are no longer available for joining when such an
+    /// event occurs (Room being Filled, Game Starting, etc).
+    /// Same applies to private rooms.
+    public_rooms: ahash::HashMap<RoomCode, RoomInfo>,
+    /// List of all private rooms
+    private_rooms: ahash::HashMap<RoomCode, RoomInfo>,
+    /// List of all public rooms available for matching
+    public_matching_pool: ahash::HashMap<RoomCode, RoomInfo>,
 }
 
 use crate::utils::{new_fast_hashmap, new_fx_hashmap};
@@ -67,7 +69,7 @@ impl Actor for Server {
 #[rtype(result = "()")]
 pub struct RegisterSession {
     pub addr: Addr<Session>,
-    pub id: String,
+    pub id: Arc<str>,
     pub server_id: u128,
 }
 
@@ -75,7 +77,7 @@ pub struct RegisterSession {
 #[rtype(result = "()")]
 pub struct DeregisterSession {
     pub server_id: u128,
-    pub id: String,
+    pub id: Arc<str>,
     pub address: Addr<Session>,
     pub reason: crate::session::message::RemoveReason,
 }
@@ -166,7 +168,7 @@ impl Handler<DeregisterSession> for Server {
 #[rtype(result = "Result<(), JoinRoomError>")]
 pub struct JoinRoom {
     server_id: u128,
-    code: Option<String>,
+    code: Option<RoomCode>,
 }
 
 impl Handler<JoinRoom> for Server {
@@ -277,7 +279,7 @@ impl Handler<CreateRoom> for Server {
                 room: Ok((code.clone(), room.addr.clone())),
             });
             if msg.public {
-                self.public_rooms.insert(code, room);
+                self.public_rooms.insert(Arc::clone(&code), room);
             }
         }
     }
@@ -291,7 +293,7 @@ pub enum RoomUnavailablityReason {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct UpdateRoomMatchAvailability {
-    pub code: String,
+    pub code: Arc<str>,
     pub reason: RoomUnavailablityReason,
 }
 
@@ -318,7 +320,7 @@ impl Handler<UpdateRoomMatchAvailability> for Server {
 /// matching queue.
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct OnRoomClosed(pub String);
+pub struct OnRoomClosed(pub Arc<str>);
 
 impl Handler<OnRoomClosed> for Server {
     type Result = ();
@@ -334,7 +336,7 @@ impl Handler<OnRoomClosed> for Server {
 /// Sessions notify the server when they join or leave a room.
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct UpdateSessionRoomInfo(pub u128, pub Option<String>);
+pub struct UpdateSessionRoomInfo(pub u128, pub Option<UserId>);
 
 impl Handler<UpdateSessionRoomInfo> for Server {
     type Result = ();
@@ -357,10 +359,15 @@ impl Handler<UpdateSessionRoomInfo> for Server {
     }
 }
 
-fn generate_room_id() -> String {
-    let mut rng = rand::thread_rng();
-    static CHARSET: &'static [u8] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".as_bytes();
-    (0..6)
-        .map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char)
-        .collect::<String>()
+fn generate_room_id() -> RoomCode {
+    const CHARSET: &'static [u8] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".as_bytes();
+    let mut arr = [0; ROOM_CODE_LENGTH];
+    let mut thread_rng = rand::thread_rng();
+    for i in 0..ROOM_CODE_LENGTH {
+        let r = thread_rng.gen_range(0..CHARSET.len());
+        arr[i] = CHARSET[r];
+    }
+    // We can guarantee that any room code we generate will be valid utf8 strings since we only use
+    // ASCII characters from an available character set.
+    unsafe { Arc::from(std::str::from_utf8_unchecked(&arr)) }
 }

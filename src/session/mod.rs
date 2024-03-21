@@ -2,28 +2,42 @@ use actix::{
     Actor, ActorContext, Addr, AsyncContext, Handler, Message, SpawnHandle, StreamHandler,
 };
 use actix_web_actors::ws::{self, ProtocolError, WebsocketContext};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::server::{DeregisterSession, RegisterSession, Server};
+use crate::server::{DeregisterSession, RegisterSession, RoomCode, Server};
 
 pub mod message;
 use crate::room::Room;
 use crate::session::message::RemoveReason;
 use message::{IncomingMessage, OutgoingMessage};
 
+pub type UserId = Arc<str>;
+
+/// How long should we wait before completely disconnecting the client if inactive
 const RECONNECTION_TIME_LIMIT: u64 = 15;
+/// How frequently should the client check for staleness
 const HB_CHECK_INTERVAL: u64 = 5;
+/// How frequently should the client send heartbeat messages
 const HB_TIME_LIMIT: u64 = 2;
 
-/* @brief Client session responsible for keeping track of client identity,
- * handling client messages, etc
- */
+/// Client session responsible for keeping track of client identity,
+/// handling client messages, etc
 pub struct Session {
-    id: Option<String>,
+    /// Client id that is used to identify the client using external authentication service providers
+    id: Option<UserId>,
+    /// Server id that is used to identify the stream the client is connected over
+    /// (this is a transient id and is not persisted)
     server_id: u128,
+    /// Last recorded heartbeat time
     hb: Instant,
+    /// Address of the [Server] actor
     server: Addr<Server>,
+    /// [SpawnHandle] of the reconnection timer if the client has disconnected
+    /// If the client doesnt reconnect before this timer runs out, the client
+    /// will be removed from any rooms they might be in
     reconnection_timer: Option<SpawnHandle>,
+    /// [Addr] of the [Room] actor, if the client is in a room
     room: Option<Addr<Room>>,
 }
 
@@ -38,10 +52,9 @@ impl Session {
             room: None,
         }
     }
-    /* @brief checks for ping every 5 seconds.
-     * If the last ping was recorded earlier than 2 seconds ago, then the
-     * client must have disconnected or have had some kind of network interruption
-     */
+    /// checks for ping every [HB_CHECK_INTERVAL] seconds.
+    /// If the last ping was recorded earlier than [HB_TIME_LIMIT] seconds ago, then the
+    /// client must have disconnected or have had some kind of network interruption
     fn heartbeat(&mut self, ctx: &mut <Self as Actor>::Context) {
         ctx.run_interval(Duration::from_secs(HB_CHECK_INTERVAL), |act, ctx| {
             if Instant::now().duration_since(act.hb).as_secs() >= HB_TIME_LIMIT {
@@ -62,7 +75,8 @@ impl Session {
                 if let Some(_) = &self.id {
                     log::error!("attempting to re-login");
                 } else {
-                    self.id = Some(id.clone());
+                    let id = Arc::from(id);
+                    self.id = Some(Arc::clone(&id));
                     self.server.do_send(RegisterSession {
                         addr: ctx.address(),
                         id,
@@ -168,7 +182,7 @@ impl Handler<Stop> for Session {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct JoinRoomResult {
-    pub room: Result<(String, Addr<Room>), crate::room::JoinRoomError>,
+    pub room: Result<(RoomCode, Addr<Room>), crate::room::JoinRoomError>,
 }
 
 impl Handler<JoinRoomResult> for Session {
@@ -184,14 +198,17 @@ impl Handler<JoinRoomResult> for Session {
                 OutgoingMessage::Result {
                     result_of: message::ResultOf::JoinRoom,
                     success: true,
-                    info: code.clone(),
+                    info: Arc::clone(&code),
                 }
             }
             Err(err) => OutgoingMessage::Result {
                 result_of: message::ResultOf::JoinRoom,
                 success: false,
-                info: serde_json::to_string(&err)
-                    .expect("failed to serialize room join failure reason"),
+                info: Arc::from(
+                    serde_json::to_string(&err)
+                        .expect("failed to serialize room join failure reason")
+                        .as_str(),
+                ),
             },
         };
         let result = serde_json::to_string(&result).expect("Failed to serialise result!");
@@ -199,11 +216,10 @@ impl Handler<JoinRoomResult> for Session {
     }
 }
 
-/* This should only be used when forcefully removing a client from a room due to reasons such
- * disconnection, room expiry, game over, etc. Willingly leaving a room should be handled more
- * gracefully by the client by clearing the self.room field before requesting to be removed from a
- * room.
- * */
+/// This should only be used when forcefully removing a client from a room due to reasons such
+/// disconnection, room expiry, game over, etc. Willingly leaving a room should be handled more
+/// gracefully by the client by clearing the self.room field before requesting to be removed from a
+/// room.
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct ClearRoom {
@@ -225,7 +241,7 @@ impl Handler<ClearRoom> for Session {
 #[derive(Message, serde::Serialize)]
 #[rtype(result = "()")]
 pub struct RestoreState {
-    pub code: String,
+    pub code: RoomCode,
     pub game: Option<crate::game::SerializedState>,
 }
 

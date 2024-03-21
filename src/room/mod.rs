@@ -1,13 +1,15 @@
 use crate::game::{Game, GameMode};
-use crate::server::{RoomUnavailablityReason, Server, UpdateRoomMatchAvailability};
+use crate::server::{RoomUnavailablityReason, Server, UpdateRoomMatchAvailability, RoomCode};
+use crate::session::UserId;
 use crate::session::{
     message::{OutgoingMessage, RemoveReason},
     RestoreState, SerializedMessage, Session,
 };
 use actix::{Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message};
+use std::sync::Arc;
 
 pub struct PlayerInRoom {
-    pub id: String,
+    pub id: Arc<str>,
     pub addr: Addr<Session>,
     // extra_info: Info
 }
@@ -28,8 +30,8 @@ impl Default for GameConfigOptions {
 pub struct Room {
     players: fxhash::FxHashMap<u128, PlayerInRoom>,
     game: Option<Game>,
-    leader: String,
-    code: String,
+    leader: UserId,
+    code: RoomCode,
     max_player_count: usize,
     server: Addr<Server>, // further configuration / extra state
     public: bool,
@@ -38,9 +40,9 @@ pub struct Room {
 
 impl Room {
     pub fn new(
-        code: String,
+        code: RoomCode,
         server: Addr<Server>,
-        leader_id: String,
+        leader_id: UserId,
         leader_addr: Addr<Session>,
         leader_server_id: u128,
         max_player_count: usize,
@@ -191,7 +193,7 @@ impl Handler<CloseRoom> for Room {
 #[rtype(result = "()")]
 pub struct ClientReconnection {
     pub addr: Addr<Session>,
-    pub id: String,
+    pub id: UserId,
     pub server_id: u128,
 }
 
@@ -227,7 +229,7 @@ pub enum StartGameError {
 #[derive(Message)]
 #[rtype(result = "Result<(), StartGameError>")]
 pub struct RequestStart {
-    pub id: String,
+    pub id: UserId,
 }
 
 impl Handler<RequestStart> for Room {
