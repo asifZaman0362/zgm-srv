@@ -5,6 +5,7 @@ use crate::session::{
     message::{OutgoingMessage, RemoveReason},
     RestoreState, SerializedMessage, Session,
 };
+use crate::session_manager::TransientId;
 use actix::{Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message};
 use std::sync::Arc;
 
@@ -28,7 +29,7 @@ impl Default for GameConfigOptions {
 }
 
 pub struct Room {
-    players: fxhash::FxHashMap<u128, PlayerInRoom>,
+    players: fxhash::FxHashMap<TransientId, PlayerInRoom>,
     game: Option<Game>,
     leader: UserId,
     code: RoomCode,
@@ -44,7 +45,7 @@ impl Room {
         server: Addr<Server>,
         leader_id: UserId,
         leader_addr: Addr<Session>,
-        leader_server_id: u128,
+        leader_server_id: TransientId,
         max_player_count: usize,
         public: bool,
     ) -> Self {
@@ -97,14 +98,14 @@ impl Actor for Room {
 #[derive(Message)]
 #[rtype(result = "Result<(), JoinRoomError>")]
 pub struct AddPlayer {
-    pub server_id: u128,
+    pub server_id: TransientId,
     pub info: PlayerInRoom,
 }
 
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct RemovePlayer {
-    pub server_id: u128,
+    pub transient_id: TransientId,
     pub reason: RemoveReason,
 }
 
@@ -160,7 +161,7 @@ impl Handler<RemovePlayer> for Room {
                  * leave. */
             }
             reason => {
-                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.server_id) {
+                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.transient_id) {
                     addr.do_send(crate::session::ClearRoom { reason });
                 }
             }
@@ -192,9 +193,8 @@ impl Handler<CloseRoom> for Room {
 #[derive(Message)]
 #[rtype(result = "()")]
 pub struct ClientReconnection {
-    pub addr: Addr<Session>,
-    pub id: UserId,
-    pub server_id: u128,
+    pub replacee: TransientId,
+    pub replacer: (TransientId, Addr<Session>)
 }
 
 impl Handler<ClientReconnection> for Room {
@@ -213,7 +213,7 @@ impl Handler<ClientReconnection> for Room {
                     game: self.game.as_ref().map(|g| g.get_state()),
                 });
                 player.addr = msg.addr;
-                self.players.insert(msg.server_id, player);
+                self.players.insert(msg.transient_id, player);
             }
             None => {}
         }

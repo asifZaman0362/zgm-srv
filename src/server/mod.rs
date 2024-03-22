@@ -113,7 +113,7 @@ impl Handler<RegisterSession> for Server {
                         room.do_send(ClientReconnection {
                             addr: msg.addr,
                             id: msg.id,
-                            server_id: msg.server_id,
+                            transient_id: msg.server_id,
                         });
                         todo!("send client update message");
                     }
@@ -155,7 +155,7 @@ impl Handler<DeregisterSession> for Server {
             if let Some(room) = data.room {
                 room.do_send(room::RemovePlayer {
                     reason: msg.reason,
-                    server_id: msg.server_id,
+                    transient_id: msg.server_id,
                 });
                 todo!("send client disconnection message to room!");
             }

@@ -10,6 +10,7 @@ use crate::server::{DeregisterSession, RegisterSession, RoomCode, Server};
 pub mod message;
 use crate::room::Room;
 use crate::session::message::RemoveReason;
+use crate::session_manager::TransientId;
 use message::{IncomingMessage, OutgoingMessage};
 
 pub type UserId = Arc<str>;
@@ -28,7 +29,7 @@ pub struct Session {
     id: Option<UserId>,
     /// Server id that is used to identify the stream the client is connected over
     /// (this is a transient id and is not persisted)
-    server_id: u128,
+    server_id: TransientId,
     /// Last recorded heartbeat time
     hb: Instant,
     /// Address of the [Server] actor
@@ -42,7 +43,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(server: Addr<Server>, server_id: u128) -> Self {
+    pub fn new(server: Addr<Server>, server_id: TransientId) -> Self {
         Self {
             id: None,
             hb: Instant::now(),
