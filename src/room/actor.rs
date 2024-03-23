@@ -1,18 +1,16 @@
+use super::RoomCode;
+use super::*;
 use crate::game::{Game, GameMode};
-use crate::server::{RoomUnavailablityReason, Server, UpdateRoomMatchAvailability, RoomCode};
-use crate::session::UserId;
+use crate::session::TransientId;
 use crate::session::{
+    actor::{ClearRoom, RestoreState, SerializedMessage, Session},
     message::{OutgoingMessage, RemoveReason},
-    RestoreState, SerializedMessage, Session,
 };
-use crate::session_manager::TransientId;
 use actix::{Actor, ActorContext, Addr, AsyncContext, Context, Handler, Message};
-use std::sync::Arc;
 
 pub struct PlayerInRoom {
-    pub id: Arc<str>,
     pub addr: Addr<Session>,
-    // extra_info: Info
+    pub transient_id: TransientId, // extra_info: Info
 }
 
 pub struct GameConfigOptions {
@@ -29,52 +27,49 @@ impl Default for GameConfigOptions {
 }
 
 pub struct Room {
-    players: fxhash::FxHashMap<TransientId, PlayerInRoom>,
+    players: Vec<Option<PlayerInRoom>>,
+    id_map: HashMap<TransientId, usize>,
     game: Option<Game>,
-    leader: UserId,
     code: RoomCode,
-    max_player_count: usize,
-    server: Addr<Server>, // further configuration / extra state
-    public: bool,
-    config: GameConfigOptions,
+    room_manager: Addr<RoomManager>, // further configuration / extra state
+    game_config: GameConfigOptions,
+    room_config: RoomConfig,
+    leader: TransientId,
 }
 
 impl Room {
     pub fn new(
         code: RoomCode,
-        server: Addr<Server>,
-        leader_id: UserId,
-        leader_addr: Addr<Session>,
-        leader_server_id: TransientId,
-        max_player_count: usize,
-        public: bool,
+        room_manager: Addr<RoomManager>,
+        leader: (TransientId, Addr<Session>),
+        room_config: RoomConfig,
     ) -> Self {
-        let leader = PlayerInRoom {
-            id: leader_id.clone(),
-            addr: leader_addr,
-        };
-        let mut players = crate::utils::new_fx_hashmap(max_player_count);
-        players.insert(leader_server_id, leader);
+        let (transient_id, addr) = leader;
+        let leader = PlayerInRoom { addr, transient_id };
+        let mut id_map = crate::utils::new_fast_hashmap(room_config.max_player_count as usize);
+        id_map.insert(transient_id, 0usize);
+        let mut players = Vec::with_capacity(room_config.max_player_count as usize);
+        players.push(Some(leader));
         Self {
             players,
             game: None,
-            leader: leader_id,
+            id_map,
+            leader: transient_id,
             code,
-            max_player_count,
-            server,
-            public,
-            config: Default::default(),
+            room_manager,
+            game_config: Default::default(),
+            room_config,
         }
     }
     fn start_game(&mut self, ctx: &mut <Self as Actor>::Context) {
         self.game = Some(Game::new(
             ctx.address(),
-            self.players.values(),
-            self.config.mode,
+            &self.players,
+            self.game_config.mode,
         ));
-        self.server.do_send(UpdateRoomMatchAvailability {
+        self.room_manager.do_send(UpdateRoomMatchAvailability {
             code: self.code.clone(),
-            reason: RoomUnavailablityReason::GameStarted,
+            availability: Availability::Unavailable(RoomUnavailablityReason::GameStarted),
         });
         todo!("inform players that game has started!");
     }
@@ -86,20 +81,14 @@ impl Actor for Room {
         if let Some(game) = &mut self.game {
             game.stop(ctx)
         }
-        for (_, PlayerInRoom { addr, .. }) in self.players.iter() {
+        for player in self.players.iter().filter(|x| x.is_some()) {
+            let PlayerInRoom { addr, .. } = player.as_ref().unwrap();
             addr.do_send(SerializedMessage(OutgoingMessage::RemoveFromRoom(
                 RemoveReason::RoomClosed,
             )));
         }
-        self.server.do_send(crate::server::OnRoomClosed(self.code.clone()));
+        self.room_manager.do_send(OnRoomClosed(self.code.clone()));
     }
-}
-
-#[derive(Message)]
-#[rtype(result = "Result<(), JoinRoomError>")]
-pub struct AddPlayer {
-    pub server_id: TransientId,
-    pub info: PlayerInRoom,
 }
 
 #[derive(Message)]
@@ -120,31 +109,42 @@ pub enum JoinRoomError {
     AlreadyInRoom,
     RoomNotFound,
     NotSignedIn,
+    InvalidCode,
+    InternalServerError,
 }
 
+#[derive(Message)]
+#[rtype(result = "Result<(RoomCode, Addr<Room>), JoinRoomError>")]
+pub struct AddPlayer(pub super::SessionPair);
+
 impl Handler<AddPlayer> for Room {
-    type Result = Result<(), JoinRoomError>;
-    fn handle(&mut self, msg: AddPlayer, _: &mut Self::Context) -> Self::Result {
+    type Result = Result<(RoomCode, Addr<Room>), JoinRoomError>;
+    fn handle(&mut self, msg: AddPlayer, ctx: &mut Self::Context) -> Self::Result {
+        let (id, addr) = msg.0;
         /* The default behaviour is to not allow players to join a room while a game is currently
          * in progress in that same room, however it may be deserible to add players to an ongoing
          * game, in which case the following check should be disabled or replaced with some other
          * more appropriate check */
         let result = if self.game.is_some() {
             Err(JoinRoomError::GameInProgress)
-        } else if self.players.len() > self.max_player_count {
+        } else if self.players.len() > self.room_config.max_player_count as usize {
             Err(JoinRoomError::RoomFull)
         } else {
-            if self.players.get(&msg.server_id).is_some() {
+            if self.id_map.get(&id).is_some() {
                 Err(JoinRoomError::AlreadyInRoom)
             } else {
-                self.players.insert(msg.server_id, msg.info);
-                Ok(())
+                self.id_map.insert(id, self.players.len());
+                self.players.push(Some(PlayerInRoom {
+                    addr,
+                    transient_id: id,
+                }));
+                Ok((self.code.clone(), ctx.address()))
             }
         };
-        if self.players.len() > self.max_player_count {
-            self.server.do_send(UpdateRoomMatchAvailability {
+        if self.players.len() > self.room_config.max_player_count as usize {
+            self.room_manager.do_send(UpdateRoomMatchAvailability {
                 code: self.code.clone(),
-                reason: RoomUnavailablityReason::Full,
+                availability: Availability::Unavailable(RoomUnavailablityReason::Full),
             });
         }
         result
@@ -161,8 +161,14 @@ impl Handler<RemovePlayer> for Room {
                  * leave. */
             }
             reason => {
-                if let Some(PlayerInRoom { addr, .. }) = self.players.remove(&msg.transient_id) {
-                    addr.do_send(crate::session::ClearRoom { reason });
+                if let Some(player) = self
+                    .id_map
+                    .get(&msg.transient_id)
+                    .and_then(|idx| self.players.get_mut(*idx))
+                {
+                    if let Some(PlayerInRoom { addr, .. }) = player.take() {
+                        addr.do_send(ClearRoom { reason });
+                    }
                 }
             }
         }
@@ -194,28 +200,31 @@ impl Handler<CloseRoom> for Room {
 #[rtype(result = "()")]
 pub struct ClientReconnection {
     pub replacee: TransientId,
-    pub replacer: (TransientId, Addr<Session>)
+    pub replacer: (TransientId, Addr<Session>),
 }
 
 impl Handler<ClientReconnection> for Room {
     type Result = ();
     fn handle(&mut self, msg: ClientReconnection, _: &mut Self::Context) -> Self::Result {
-        match self
-            .players
-            .iter()
-            .find(|(_, PlayerInRoom { id, .. })| id == &msg.id)
-            .map(|(id, ..)| *id)
-        {
-            Some(id) => {
-                let mut player = self.players.remove(&id).unwrap();
-                msg.addr.do_send(RestoreState {
-                    code: self.code.clone(),
-                    game: self.game.as_ref().map(|g| g.get_state()),
+        let ClientReconnection { replacee, replacer } = msg;
+        let (new_id, new_addr) = replacer;
+        if let Some(idx) = self.id_map.remove(&replacee) {
+            if let Some(old) = self.players.get_mut(idx) {
+                if let Some(old) = old.take() {
+                    new_addr.do_send(RestoreState {
+                        code: self.code.clone(),
+                        game: self.game.as_mut().map(|g| {
+                            g.update_session_info(old.addr, (new_id, new_addr.clone()));
+                            g.get_state()
+                        }),
+                    });
+                }
+                self.id_map.insert(new_id, idx);
+                *old = Some(PlayerInRoom {
+                    addr: new_addr,
+                    transient_id: new_id,
                 });
-                player.addr = msg.addr;
-                self.players.insert(msg.transient_id, player);
             }
-            None => {}
         }
     }
 }
@@ -228,9 +237,7 @@ pub enum StartGameError {
 
 #[derive(Message)]
 #[rtype(result = "Result<(), StartGameError>")]
-pub struct RequestStart {
-    pub id: UserId,
-}
+pub struct RequestStart(TransientId);
 
 impl Handler<RequestStart> for Room {
     type Result = Result<(), StartGameError>;
@@ -238,10 +245,10 @@ impl Handler<RequestStart> for Room {
         if self.game.is_some() {
             Err(StartGameError::GameAlreadyRunning)
         } else {
-            if self.public {
+            if self.room_config.public {
                 Ok(())
             } else {
-                if self.leader == msg.id {
+                if self.leader == msg.0 {
                     self.start_game(ctx);
                     Ok(())
                 } else {

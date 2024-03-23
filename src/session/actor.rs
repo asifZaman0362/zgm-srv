@@ -1,16 +1,16 @@
-use actix::{
-    Actor, ActorContext, Addr, AsyncContext, Handler, Message, SpawnHandle, StreamHandler,
-};
+use crate::room::actor::JoinRoomError;
+use crate::room::{JoinRoom, RoomManager, RoomPair, ROOM_CODE_LENGTH};
+use actix::prelude::*;
 use actix_web_actors::ws::{self, ProtocolError, WebsocketContext};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::server::{DeregisterSession, RegisterSession, RoomCode, Server};
+use super::{message::ResultOf, RoomCode};
 
-use crate::session::Room;
-use crate::session::message::RemoveReason;
-use super::TransientId;
 use super::message::{IncomingMessage, OutgoingMessage};
+use super::{Register, Room, SessionManager, UpdateSessionRoomInfo};
+use super::{TransientId, Unregister};
+use crate::session::message::RemoveReason;
 
 pub type UserId = Arc<str>;
 
@@ -28,26 +28,31 @@ pub struct Session {
     id: Option<UserId>,
     /// Server id that is used to identify the stream the client is connected over
     /// (this is a transient id and is not persisted)
-    server_id: TransientId,
+    transient_id: Option<TransientId>,
     /// Last recorded heartbeat time
     hb: Instant,
     /// Address of the [Server] actor
-    server: Addr<Server>,
+    session_manager: Addr<SessionManager>,
     /// [SpawnHandle] of the reconnection timer if the client has disconnected
     /// If the client doesnt reconnect before this timer runs out, the client
     /// will be removed from any rooms they might be in
     reconnection_timer: Option<SpawnHandle>,
     /// [Addr] of the [Room] actor, if the client is in a room
     room: Option<Addr<Room>>,
+    room_manager: Addr<RoomManager>,
 }
 
 impl Session {
-    pub fn new(server: Addr<Server>, server_id: TransientId) -> Self {
+    pub fn new(
+        session_manager: Addr<SessionManager>,
+        room_manager: Addr<RoomManager>,
+    ) -> Self {
         Self {
+            room_manager,
+            transient_id: None,
             id: None,
             hb: Instant::now(),
-            server,
-            server_id,
+            session_manager,
             reconnection_timer: None,
             room: None,
         }
@@ -69,6 +74,43 @@ impl Session {
             }
         });
     }
+    fn join_room(&mut self, code: Option<RoomCode>, ctx: &mut <Self as Actor>::Context) {
+        self.room_manager
+            .send(JoinRoom {
+                session: (
+                    self.transient_id.expect("must be registered"),
+                    ctx.address(),
+                ),
+                code,
+            })
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                let result = match res {
+                    Ok(res) => match res {
+                        Ok(RoomPair { code, addr }) => {
+                            act.room = Some(addr.clone());
+                            act.session_manager.do_send(UpdateSessionRoomInfo(
+                                act.transient_id.expect("must be registered"),
+                                Some(addr),
+                            ));
+                            super::message::result(ResultOf::JoinRoom, true, &code)
+                        }
+                        Err(err) => super::message::result(ResultOf::JoinRoom, false, &err),
+                    },
+                    Err(err) => {
+                        log::error!("{err}");
+                        super::message::result(
+                            ResultOf::JoinRoom,
+                            false,
+                            &JoinRoomError::InternalServerError,
+                        )
+                    }
+                };
+                ctx.text(result);
+                actix::fut::ready(())
+            })
+            .wait(ctx);
+    }
     fn handle_message(&mut self, msg: IncomingMessage, ctx: &mut <Self as Actor>::Context) {
         match msg {
             IncomingMessage::Login(id) => {
@@ -77,26 +119,50 @@ impl Session {
                 } else {
                     let id = Arc::from(id);
                     self.id = Some(Arc::clone(&id));
-                    self.server.do_send(RegisterSession {
-                        addr: ctx.address(),
-                        id,
-                        server_id: self.server_id,
-                    });
+                    self.session_manager
+                        .send(Register {
+                            session_addr: ctx.address(),
+                            user_id: id,
+                        })
+                        .into_actor(self)
+                        .then(|res, act, _| {
+                            match res {
+                                Ok(transient_id) => act.transient_id = Some(transient_id),
+                                Err(err) => log::error!("{err}"),
+                            }
+                            actix::fut::ready(())
+                        })
+                        .wait(ctx);
                 }
             }
             IncomingMessage::Logout => {
-                if let Some(id) = self.id.take() {
-                    let server_id = self.server_id;
-                    let address = ctx.address();
+                if let Some(transient_id) = self.transient_id.take() {
+                    self.id.take();
                     let reason = RemoveReason::Logout;
-                    self.server.do_send(DeregisterSession {
-                        server_id,
-                        id,
-                        address,
+                    self.session_manager.do_send(Unregister {
+                        transient_id,
                         reason,
                     });
                 }
                 ctx.stop();
+            }
+            IncomingMessage::JoinRoom(code) => {
+                let res = code.map_or(Ok(None), |code| {
+                    string_to_code(code).map_or_else(
+                        |_| {
+                            ctx.text(super::message::result(
+                                ResultOf::JoinRoom,
+                                false,
+                                &JoinRoomError::InvalidCode,
+                            ));
+                            Err(())
+                        },
+                        |chars| Ok(Some(chars)),
+                    )
+                });
+                if let Ok(code) = res {
+                    self.join_room(code, ctx)
+                }
             }
             _ => todo!("handle other messages"),
         }
@@ -114,17 +180,15 @@ impl Actor for Session {
         }
         // Upon normal termination, the sessions id should be removed before disconnection,
         // if not done so, it means something probably went wrong and therefore should be notified
-        // to the server and to any related rooms
-        if let Some(id) = self.id.take() {
-            self.server.do_send(DeregisterSession {
-                server_id: self.server_id,
-                id,
+        // to the session_manager and to any related rooms
+        if let Some(transient_id) = self.transient_id.take() {
+            self.session_manager.do_send(Unregister {
+                transient_id,
                 /* Removal reason in this message is only used if the client was still in a room at
                  * the time of termination which can only be possible due to either a network
                  * disconnection or a crash on the client side. Upon normal termination, the client
                  * is expected to send a room leaving message before terminating.*/
                 reason: RemoveReason::Disconnected,
-                address: ctx.address(),
             });
         }
     }
@@ -162,7 +226,7 @@ impl Handler<SerializedMessage> for Session {
     }
 }
 
-/// Sent by the server in the event where the client reconnects from a different stream.
+/// Sent by the session_manager in the event where the client reconnects from a different stream.
 /// This message is required because the older session controller (the one receiving this message)
 /// might have a reconnection timer, which upon evaluating will result in the permanent removal of
 /// the client from any rooms they might be in before losing connection.
@@ -176,43 +240,6 @@ impl Handler<Stop> for Session {
         // ID should be removed upon normal termination
         self.id.take();
         ctx.stop();
-    }
-}
-
-#[derive(Message)]
-#[rtype(result = "()")]
-pub struct JoinRoomResult {
-    pub room: Result<(RoomCode, Addr<Room>), crate::room::JoinRoomError>,
-}
-
-impl Handler<JoinRoomResult> for Session {
-    type Result = ();
-    fn handle(&mut self, msg: JoinRoomResult, ctx: &mut Self::Context) -> Self::Result {
-        let result = match msg.room {
-            Ok((code, addr)) => {
-                self.room = Some(addr);
-                self.server.do_send(crate::server::UpdateSessionRoomInfo(
-                    self.server_id,
-                    Some(code.clone()),
-                ));
-                OutgoingMessage::Result {
-                    result_of: message::ResultOf::JoinRoom,
-                    success: true,
-                    info: Arc::clone(&code),
-                }
-            }
-            Err(err) => OutgoingMessage::Result {
-                result_of: message::ResultOf::JoinRoom,
-                success: false,
-                info: Arc::from(
-                    serde_json::to_string(&err)
-                        .expect("failed to serialize room join failure reason")
-                        .as_str(),
-                ),
-            },
-        };
-        let result = serde_json::to_string(&result).expect("Failed to serialise result!");
-        ctx.text(result);
     }
 }
 
@@ -233,8 +260,10 @@ impl Handler<ClearRoom> for Session {
         let msg = OutgoingMessage::RemoveFromRoom(msg.reason);
         let msg = serde_json::to_string(&msg).unwrap();
         ctx.text(msg);
-        self.server
-            .do_send(crate::server::UpdateSessionRoomInfo(self.server_id, None));
+        self.session_manager.do_send(UpdateSessionRoomInfo(
+            self.transient_id.expect("must be registered"),
+            None,
+        ));
     }
 }
 
@@ -252,5 +281,29 @@ impl Handler<RestoreState> for Session {
             Ok(res) => ctx.text(res),
             Err(err) => log::error!("game state serialization failed! {err}"),
         }
+    }
+}
+
+fn code_to_string(code: &[char]) -> Result<String, ()> {
+    if code.len() != ROOM_CODE_LENGTH {
+        Err(())
+    } else {
+        let mut string = String::new();
+        for char in code {
+            string.push(*char);
+        }
+        Ok(string)
+    }
+}
+
+fn string_to_code(str: &str) -> Result<[char; ROOM_CODE_LENGTH], ()> {
+    if str.len() != ROOM_CODE_LENGTH {
+        Err(())
+    } else {
+        let mut buf = ['0'; ROOM_CODE_LENGTH];
+        for (i, char) in str.chars().enumerate() {
+            buf[i] = char;
+        }
+        Ok(buf)
     }
 }

@@ -1,5 +1,6 @@
-use crate::room::{PlayerInRoom, Room};
-use crate::session::{Session, UserId};
+use crate::room::actor::{PlayerInRoom, Room};
+use crate::session::actor::Session;
+use crate::session::TransientId;
 use actix::{Actor, Addr};
 use serde::Serialize;
 use std::collections::HashMap;
@@ -10,9 +11,8 @@ pub struct SerializedState {}
 
 /// State tied to individual players such as their score
 struct PlayerState {
-    addr: Addr<Session>,
-    id: UserId,
     score: usize,
+    id: TransientId,
 }
 
 /// Common game state, that applies to all game modes
@@ -32,22 +32,26 @@ pub struct Game {
 impl From<&PlayerInRoom> for PlayerState {
     fn from(value: &PlayerInRoom) -> Self {
         Self {
-            addr: value.addr.clone(),
-            id: value.id.clone(),
-            score: Default::default()
+            score: Default::default(),
+            id: value.transient_id,
         }
     }
 }
 
 impl Game {
-    pub fn new<'a>(
+    pub fn new(
         room: Addr<Room>,
-        player_iter: impl Iterator<Item = &'a PlayerInRoom>,
+        player_iter: &Vec<Option<PlayerInRoom>>,
         game_mode: GameMode,
     ) -> Self {
         let mut players = HashMap::new();
-        for player in player_iter.map(|player| PlayerState::from(player)) {
-            players.insert(player.addr.clone(), player);
+        for (addr, state) in player_iter.iter().filter(|x| x.is_some()).map(|player| {
+            (
+                player.as_ref().unwrap().addr.clone(),
+                PlayerState::from(player.as_ref().unwrap()),
+            )
+        }) {
+            players.insert(addr.clone(), state);
         }
         let state = GameState { players };
         let controller = Box::new(match game_mode {
@@ -64,6 +68,12 @@ impl Game {
     }
     pub fn get_state(&self) -> SerializedState {
         SerializedState {}
+    }
+    pub fn update_session_info(&mut self, old: Addr<Session>, new: (TransientId, Addr<Session>)) {
+        if let Some(mut state) = self.state.players.remove(&old) {
+            state.id = new.0;
+            self.state.players.insert(new.1, state);
+        }
     }
 }
 
