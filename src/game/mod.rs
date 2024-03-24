@@ -1,32 +1,35 @@
 use crate::room::actor::{PlayerInRoom, Room};
-use crate::session::actor::Session;
 use crate::session::TransientId;
-use actix::{Actor, Addr};
+use actix::Context;
 use serde::Serialize;
-use std::collections::HashMap;
 
 /// Game state for client side state restoration upon reconnection */
 #[derive(Serialize)]
-pub struct SerializedState {}
+pub struct SerializedState {
+    word: String,
+    time_remaining: Option<u64>,
+    turn: TransientId,
+    score: usize,
+}
 
 /// State tied to individual players such as their score
 struct PlayerState {
     score: usize,
     id: TransientId,
+    alive: bool,
 }
 
 /// Common game state, that applies to all game modes
-struct GameState {
-    players: HashMap<Addr<Session>, PlayerState>,
+pub struct GameState {
+    player_data: Vec<Option<PlayerState>>,
+    word: String,
+    turn: usize,
+    timer: Option<(actix::SpawnHandle, std::time::Instant)>,
 }
 
 pub struct Game {
     /// Common game state, that applies to all game modes
     state: GameState,
-    /// Address([`Addr`]) of the parent room the game is running in
-    room: Addr<Room>,
-    /// Mode specific game controller. This is where the real action happens
-    controller: Box<dyn GameController<Context = <Room as Actor>::Context>>,
 }
 
 impl From<&PlayerInRoom> for PlayerState {
@@ -34,51 +37,51 @@ impl From<&PlayerInRoom> for PlayerState {
         Self {
             score: Default::default(),
             id: value.transient_id,
+            alive: true,
         }
     }
 }
 
 impl Game {
-    pub fn new(
-        room: Addr<Room>,
-        player_iter: &Vec<Option<PlayerInRoom>>,
-        game_mode: GameMode,
-    ) -> Self {
-        let mut players = HashMap::new();
-        for (addr, state) in player_iter.iter().filter(|x| x.is_some()).map(|player| {
-            (
-                player.as_ref().unwrap().addr.clone(),
-                PlayerState::from(player.as_ref().unwrap()),
-            )
-        }) {
-            players.insert(addr.clone(), state);
-        }
-        let state = GameState { players };
-        let controller = Box::new(match game_mode {
-            GameMode::Standard => StandardGame {},
+    pub fn new(players: &Vec<Option<PlayerInRoom>>, game_mode: GameMode) -> Self {
+        let player_data = players
+            .iter()
+            .map(|x| x.as_ref().map(|x| PlayerState::from(x)))
+            .collect::<Vec<_>>();
+        let state = GameState {
+            player_data,
+            word: "".to_string(),
+            turn: 0,
+            timer: None,
+        };
+        Self { state }
+    }
+    pub fn get_state(&self, player: usize) -> SerializedState {
+        let state = &self.state;
+        let word = state.word.clone();
+        let time_remaining = state.timer.map(|(_, trigger_time)| {
+            trigger_time
+                .duration_since(std::time::Instant::now())
+                .as_secs()
         });
-        Self {
-            state,
-            room,
-            controller,
-        }
-    }
-    pub fn stop(&mut self, ctx: &mut <Room as Actor>::Context) {
-        self.controller.on_end(ctx);
-    }
-    pub fn get_state(&self) -> SerializedState {
-        SerializedState {}
-    }
-    pub fn update_session_info(&mut self, old: Addr<Session>, new: (TransientId, Addr<Session>)) {
-        if let Some(mut state) = self.state.players.remove(&old) {
-            state.id = new.0;
-            self.state.players.insert(new.1, state);
+        let turn = state.turn;
+        let score = state
+            .player_data
+            .get(player)
+            .expect("data doesnt exist for player!")
+            .as_ref()
+            .expect("player data cannot be empty!")
+            .score;
+        SerializedState {
+            word,
+            time_remaining,
+            turn: turn.try_into().unwrap(),
+            score,
         }
     }
 }
 
-/// Available game modes
-#[derive(Clone, Copy)]
+#[derive(Copy, Clone)]
 pub enum GameMode {
     Standard,
 }
@@ -89,26 +92,62 @@ impl Default for GameMode {
     }
 }
 
-/// Game Controller interface for game logic
-///
-/// Game modes can be defined using a game controller trait which exhibits necessary behaviour,
-/// the details of which can be dynamic. Note that the following trait only provides a basic outline
-/// which might not always be applicable to all use cases. The design of this trait is entirely
-/// dependant on the game's design.
-pub trait GameController {
-    /// The [`actix::Context`] of the parent [`Actor`]
-    type Context;
-    /// Called when the game is first started
-    fn on_start(&self, ctx: &mut Self::Context);
-    /// Called when the game ends
-    fn on_end(&self, ctx: &mut Self::Context);
-}
-
 /// Example implementation of a game mode
 struct StandardGame {}
 
-impl GameController for StandardGame {
-    type Context = <Room as Actor>::Context;
-    fn on_start(&self, _ctx: &mut Self::Context) {}
-    fn on_end(&self, _ctx: &mut Self::Context) {}
+impl StandardGame {
+    fn next_turn(&self, state: &mut GameState, room: &Room) {
+        state.turn = if let Some(next) = state.player_data.as_slice()[state.turn..]
+            .iter()
+            .position(|x| x.as_ref().map_or(false, |state| state.alive))
+        {
+            next
+        } else {
+            state
+                .player_data
+                .iter()
+                .position(|x| x.as_ref().map_or(false, |state| state.alive))
+                .expect("everyone cannot be dead!")
+        };
+        room.notify_clients(
+            crate::session::message::OutgoingMessage::TurnUpdate(room.get_id(state.turn).unwrap()),
+            None,
+        );
+    }
 }
+
+pub trait GameController {
+    type Ctx;
+    type GameInput;
+    type SerializedState;
+    fn on_begin(&mut self, ctx: &mut Self::Ctx);
+    fn on_end(&mut self, ctx: &mut Self::Ctx);
+    fn on_pause(&mut self, ctx: &mut Self::Ctx);
+    fn on_resume(&mut self, ctx: &mut Self::Ctx);
+    fn on_input(&mut self, ctx: &mut Self::Ctx, input: &Self::GameInput);
+    fn get_state(&self, player: usize) -> Self::SerializedState;
+}
+
+pub enum Input {
+    Word(String)
+}
+
+impl GameController for Game {
+    type Ctx = Context<Room>;
+    type GameInput = Input;
+    type SerializedState = String;
+    fn on_begin(&mut self, ctx: &mut Self::Ctx) {
+    }
+    fn on_input(&mut self, ctx: &mut Self::Ctx, input: &Self::GameInput) {
+    }
+    fn on_pause(&mut self, ctx: &mut Self::Ctx) {
+    }
+    fn on_resume(&mut self, ctx: &mut Self::Ctx) {
+    }
+    fn on_end(&mut self, ctx: &mut Self::Ctx) {
+    }
+    fn get_state<'a>(&'a self, player: usize) -> Self::SerializedState {
+        serde_json::to_string(&self.get_state(player)).unwrap()
+    }
+}
+

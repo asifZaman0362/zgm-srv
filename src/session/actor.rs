@@ -5,7 +5,7 @@ use actix_web_actors::ws::{self, ProtocolError, WebsocketContext};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{message::ResultOf, RoomCode};
+use super::{message, RoomCode};
 
 use super::message::{IncomingMessage, OutgoingMessage};
 use super::{Register, Room, SessionManager, UpdateSessionRoomInfo};
@@ -90,20 +90,16 @@ impl Session {
                                 act.transient_id.expect("must be registered"),
                                 Some(addr),
                             ));
-                            super::message::result(ResultOf::JoinRoom, true, &code_to_string(&code))
+                            message::Result::Success(code_to_string(&code).unwrap().to_string())
                         }
-                        Err(err) => super::message::result(ResultOf::JoinRoom, false, &err),
+                        Err(err) => message::Result::Error(err)
                     },
                     Err(err) => {
                         log::error!("{err}");
-                        super::message::result(
-                            ResultOf::JoinRoom,
-                            false,
-                            &JoinRoomError::InternalServerError,
-                        )
+                        message::Result::Error(JoinRoomError::InternalServerError)
                     }
                 };
-                ctx.text(result);
+                ctx.text(OutgoingMessage::JoinRoomResult(result));
                 actix::fut::ready(())
             })
             .wait(ctx);
@@ -147,11 +143,7 @@ impl Session {
                 let res = code.map_or(Ok(None), |code| {
                     string_to_code(code).map_or_else(
                         |_| {
-                            ctx.text(super::message::result(
-                                ResultOf::JoinRoom,
-                                false,
-                                &JoinRoomError::InvalidCode,
-                            ));
+                            ctx.text(OutgoingMessage::JoinRoomResult(message::Result::Error(JoinRoomError::InvalidCode)));
                             Err(())
                         },
                         |chars| Ok(Some(chars)),
@@ -268,16 +260,13 @@ impl Handler<ClearRoom> for Session {
 #[rtype(result = "()")]
 pub struct RestoreState {
     pub code: RoomCode,
-    pub game: Option<crate::game::SerializedState>,
+    pub game: String
 }
 
 impl Handler<RestoreState> for Session {
     type Result = ();
     fn handle(&mut self, msg: RestoreState, ctx: &mut Self::Context) -> Self::Result {
-        match serde_json::to_string(&msg) {
-            Ok(res) => ctx.text(res),
-            Err(err) => log::error!("game state serialization failed! {err}"),
-        }
+        ctx.text(msg.game)
     }
 }
 

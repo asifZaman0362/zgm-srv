@@ -1,5 +1,5 @@
 use actix::prelude::*;
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 
 use actor::Room;
 use fastrand::Rng;
@@ -57,9 +57,9 @@ pub struct RoomManager {
 impl RoomManager {
     pub fn new() -> Self {
         const capacity: usize = 1 << 12;
-        let free: HashMap<RoomCode, RoomInfo> = crate::utils::new_fast_hashmap(capacity);
-        let reserved: HashMap<RoomCode, RoomInfo> = crate::utils::new_fast_hashmap(capacity);
-        let open: HashMap<RoomCode, RoomInfo> = crate::utils::new_fast_hashmap(capacity);
+        let free: HashMap<RoomCode, RoomInfo> = HashMap::with_capacity(capacity);
+        let reserved: HashMap<RoomCode, RoomInfo> = HashMap::with_capacity(capacity);
+        let open: HashMap<RoomCode, RoomInfo> = HashMap::with_capacity(capacity);
         Self {
             free,
             reserved,

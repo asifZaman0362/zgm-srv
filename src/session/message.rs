@@ -1,7 +1,9 @@
 use bytestring::ByteString;
 use serde::{Deserialize, Serialize};
+use crate::{session::TransientId, room::actor::JoinRoomError};
 
 #[derive(Deserialize)]
+#[serde(tag = "kind", content = "data")]
 pub enum IncomingMessage<'a> {
     Login(&'a str),
     JoinRoom(Option<&'a str>),
@@ -9,7 +11,7 @@ pub enum IncomingMessage<'a> {
     // Add more types here
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub enum RemoveReason {
     RoomClosed,
     Logout,
@@ -18,33 +20,27 @@ pub enum RemoveReason {
     IdMismatch,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub enum ResultOf {
     JoinRoom,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
+#[serde(tag = "status", content = "data")]
+pub enum Result<T, E> {
+    Success(T),
+    Error(E)
+}
+
+#[derive(Serialize, Clone)]
+#[serde(tag = "kind", content = "data")]
 pub enum OutgoingMessage {
     RemoveFromRoom(RemoveReason),
     ForceDisconnect(RemoveReason),
     GameStarted,
     GameEnd,
-    /* As much as it hurts my soul, we cant use rust like enum types here because we cant
-     * be sure if the client technology is equipped to deserialise such messages. */
-    Result {
-        result_of: ResultOf,
-        success: bool,
-        info: String,
-    }, // Add more types here
-}
-
-pub fn result(result_of: ResultOf, success: bool, info: &impl Serialize) -> OutgoingMessage {
-    let info = serde_json::to_string(&info).unwrap();
-    OutgoingMessage::Result {
-        result_of,
-        success,
-        info,
-    }
+    JoinRoomResult(Result<String, JoinRoomError>),
+    TurnUpdate(TransientId)
 }
 
 impl Into<ByteString> for OutgoingMessage {

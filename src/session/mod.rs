@@ -4,10 +4,9 @@ use crate::{
         RoomCode,
     },
     session::{actor::Session, message::RemoveReason},
-    utils::new_fast_hashmap,
 };
 use actix::prelude::*;
-use ahash::HashMap;
+use ahash::{HashMap, HashMapExt};
 use std::sync::Arc;
 
 pub mod actor;
@@ -38,9 +37,9 @@ pub struct SessionManager {
 impl SessionManager {
     pub fn new() -> Self {
         Self {
-            sessions: new_fast_hashmap(1 << 12),
+            sessions: HashMap::with_capacity(1 << 12),
             temp_id_counter: 0,
-            transient_id_map: new_fast_hashmap(1 << 12),
+            transient_id_map: HashMap::with_capacity(1 << 12),
         }
     }
 
