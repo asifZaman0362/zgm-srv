@@ -43,10 +43,7 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn new(
-        session_manager: Addr<SessionManager>,
-        room_manager: Addr<RoomManager>,
-    ) -> Self {
+    pub fn new(session_manager: Addr<SessionManager>, room_manager: Addr<RoomManager>) -> Self {
         Self {
             room_manager,
             transient_id: None,
@@ -93,7 +90,7 @@ impl Session {
                                 act.transient_id.expect("must be registered"),
                                 Some(addr),
                             ));
-                            super::message::result(ResultOf::JoinRoom, true, &code)
+                            super::message::result(ResultOf::JoinRoom, true, &code_to_string(&code))
                         }
                         Err(err) => super::message::result(ResultOf::JoinRoom, false, &err),
                     },
@@ -284,25 +281,21 @@ impl Handler<RestoreState> for Session {
     }
 }
 
-fn code_to_string(code: &[char]) -> Result<String, ()> {
+fn code_to_string<'a>(code: &'a [u8]) -> Result<std::borrow::Cow<'a, str>, ()> {
     if code.len() != ROOM_CODE_LENGTH {
         Err(())
     } else {
-        let mut string = String::new();
-        for char in code {
-            string.push(*char);
-        }
-        Ok(string)
+        Ok(String::from_utf8_lossy(code))
     }
 }
 
-fn string_to_code(str: &str) -> Result<[char; ROOM_CODE_LENGTH], ()> {
+fn string_to_code(str: &str) -> Result<RoomCode, ()> {
     if str.len() != ROOM_CODE_LENGTH {
         Err(())
     } else {
-        let mut buf = ['0'; ROOM_CODE_LENGTH];
-        for (i, char) in str.chars().enumerate() {
-            buf[i] = char;
+        let mut buf = [0; ROOM_CODE_LENGTH];
+        for (i, char) in str.as_bytes().iter().enumerate() {
+            buf[i] = *char;
         }
         Ok(buf)
     }

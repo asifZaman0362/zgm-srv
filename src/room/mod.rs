@@ -46,7 +46,7 @@ impl RoomInfo {
 }
 
 pub const ROOM_CODE_LENGTH: usize = 4;
-pub type RoomCode = [char; ROOM_CODE_LENGTH];
+pub type RoomCode = [u8; ROOM_CODE_LENGTH];
 
 pub struct RoomManager {
     free: HashMap<RoomCode, RoomInfo>,
@@ -275,11 +275,11 @@ impl Handler<OnRoomClosed> for RoomManager {
 
 fn generate_room_id() -> RoomCode {
     const CHARSET: &'static [u8] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789".as_bytes();
-    let mut arr = ['\0'; ROOM_CODE_LENGTH];
+    let mut arr = [0; ROOM_CODE_LENGTH];
     let mut rng = Rng::new();
     for i in 0..ROOM_CODE_LENGTH {
         let r = rng.usize(0..CHARSET.len());
-        arr[i] = CHARSET[r] as char;
+        arr[i] = CHARSET[r];
     }
     arr
 }
